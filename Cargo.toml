@@ -1,0 +1,48 @@
+[package]
+name = "sinc"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = ["left"]
+left = []
+right = []
+
+[dependencies]
+cortex-m = "0.7.7"
+cortex-m-rt = { version = "0.7.3", features = ["device"] }
+cortex-m-rtic = "1.1.4"
+
+embedded-time = "0.12.1"
+
+usb-device= "0.2.8"
+usbd-serial = "0.1.1"
+usbd-hid = "0.5.0"
+
+defmt = "0.3"
+defmt-rtt = "0.4"
+
+keyberon = { git = "https://github.com/TeXitoi/keyberon", rev = "a423de29a9cf0e9e4d3bdddc6958657662c46e01" }
+panic-halt = "0.2.0"
+embedded-hal = "0.2.5" 
+rp2040-hal = { version = "0.5.0", features = ["rt"] }
+rp2040-boot2 = "0.3.0"
+
+# cargo build/run
+[profile.dev]
+codegen-units = 1
+debug = 2
+debug-assertions = true
+incremental = false
+opt-level = 3
+overflow-checks = true
+
+# cargo build/run --release
+[profile.release]
+codegen-units = 1
+debug = 2
+debug-assertions = false
+incremental = false
+lto = 'fat'
+opt-level = 3
+overflow-checks = false
