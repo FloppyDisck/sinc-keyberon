@@ -11,11 +11,12 @@ pub static BOOT_LOADER: [u8; 256] = rp2040_boot2::BOOT_LOADER_W25Q080;
 
 #[rtic::app(device = rp2040_hal::pac, peripherals = true, dispatchers = [PIO0_IRQ_0, PIO0_IRQ_1, PIO1_IRQ_0])]
 mod app {
-    use crate::layout::RIGHT_LAYER;
+    use crate::layout::{LEFT_LAYER, RIGHT_LAYER};
     use cortex_m::delay::Delay;
     use cortex_m::prelude::{
         _embedded_hal_watchdog_Watchdog, _embedded_hal_watchdog_WatchdogEnable,
     };
+    use embedded_hal::digital::v2::InputPin;
     use embedded_time::duration::Extensions;
     use keyberon::debounce::Debouncer;
     use keyberon::key_code;
@@ -23,6 +24,7 @@ mod app {
     use keyberon::matrix::Matrix;
     use rp2040_hal::clocks::init_clocks_and_plls;
     use rp2040_hal::gpio::{DynPin, Pins};
+    use rp2040_hal::pac::UART0;
     use rp2040_hal::timer::{Alarm, Alarm0};
     use rp2040_hal::usb::UsbBus;
     use rp2040_hal::{Clock, Sio, Timer, Watchdog};
@@ -53,6 +55,8 @@ mod app {
         matrix: Matrix<DynPin, DynPin, 9, 6>,
         #[lock_free]
         debouncer: Debouncer<[[bool; 9]; 6]>,
+        left_side: bool,
+        uart: UART0,
     }
 
     static mut USB_BUS: Option<UsbBusAllocator<UsbBus>> = None;
@@ -87,11 +91,28 @@ mod app {
             &mut resets,
         );
 
+        let side = pins.gpio4.into_floating_input();
+        let left_side = side.is_high().unwrap();
+
         let mut timer = Timer::new(c.device.TIMER, &mut resets);
         let delay = Delay::new(c.core.SYST, clocks.system_clock.freq().0);
         let mut alarm = timer.alarm_0().unwrap();
         let _ = alarm.schedule(TIMER.microseconds());
         alarm.enable_interrupt();
+
+        // Enable UART0
+        resets.reset.modify(|_, w| w.uart0().clear_bit());
+        // Wait for clear
+        while resets.reset_done.read().uart0().bit_is_clear() {}
+        let uart = c.device.UART0;
+        // Baudrate is configured as integer / fraction
+        // Integer = 67
+        uart.uartibrd.write(|w| unsafe { w.bits(0b0100_0011) });
+        // Decimal = 52
+        uart.uartfbrd.write(|w| unsafe { w.bits(0b0011_0100) });
+        uart.uartlcr_h.write(|w| unsafe { w.bits(0b0110_0000) });
+        uart.uartcr.write(|w| unsafe { w.bits(0b11_0000_0001) });
+        uart.uartimsc.write(|w| w.rxim().set_bit());
 
         let usb_bus = UsbBusAllocator::new(UsbBus::new(
             c.device.USBCTRL_REGS,
@@ -110,6 +131,26 @@ mod app {
 
         watchdog.start(10_000.microseconds());
 
+        let rows = if left_side {
+            [
+                pins.gpio26.into_push_pull_output().into(),
+                pins.gpio25.into_push_pull_output().into(),
+                pins.gpio19.into_push_pull_output().into(),
+                pins.gpio24.into_push_pull_output().into(),
+                pins.gpio17.into_push_pull_output().into(),
+                pins.gpio16.into_push_pull_output().into(),
+            ]
+        } else {
+            [
+                pins.gpio26.into_push_pull_output().into(),
+                pins.gpio16.into_push_pull_output().into(),
+                pins.gpio19.into_push_pull_output().into(),
+                pins.gpio17.into_push_pull_output().into(),
+                pins.gpio9.into_push_pull_output().into(),
+                pins.gpio8.into_push_pull_output().into(),
+            ]
+        };
+
         (
             Shared {
                 usb_dev,
@@ -118,7 +159,11 @@ mod app {
                 timer,
                 alarm,
                 watchdog,
-                layout: Layout::new(&RIGHT_LAYER),
+                layout: if left_side {
+                    Layout::new(&LEFT_LAYER)
+                } else {
+                    Layout::new(&RIGHT_LAYER)
+                },
                 // COL2ROW
                 matrix: Matrix::new(
                     [
@@ -132,25 +177,12 @@ mod app {
                         pins.gpio12.into_pull_up_input().into(),
                         pins.gpio13.into_pull_up_input().into(),
                     ],
-                    // [
-                    //     pins.gpio16.into_push_pull_output().into(),
-                    //     pins.gpio19.into_push_pull_output().into(),
-                    //     pins.gpio17.into_push_pull_output().into(),
-                    //     pins.gpio9.into_push_pull_output().into(),
-                    //     pins.gpio8.into_push_pull_output().into(),
-                    //     pins.gpio26.into_push_pull_output().into(),
-                    // ],
-                    [
-                        pins.gpio26.into_push_pull_output().into(),
-                        pins.gpio16.into_push_pull_output().into(),
-                        pins.gpio19.into_push_pull_output().into(),
-                        pins.gpio17.into_push_pull_output().into(),
-                        pins.gpio9.into_push_pull_output().into(),
-                        pins.gpio8.into_push_pull_output().into(),
-                    ],
+                    rows,
                 )
                 .unwrap(),
                 debouncer: Debouncer::new([[false; 9]; 6], [[false; 9]; 6], 10),
+                left_side,
+                uart,
             },
             Local {},
             init::Monotonics(),
