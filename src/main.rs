@@ -11,26 +11,48 @@ pub static BOOT_LOADER: [u8; 256] = rp2040_boot2::BOOT_LOADER_W25Q080;
 
 #[rtic::app(device = rp2040_hal::pac, peripherals = true, dispatchers = [PIO0_IRQ_0, PIO0_IRQ_1, PIO1_IRQ_0])]
 mod app {
-    use crate::layout::{LEFT_LAYER, RIGHT_LAYER};
+    use crate::layout::{LAYER, LEFT_LAYER, RIGHT_LAYER};
     use cortex_m::delay::Delay;
     use cortex_m::prelude::{
         _embedded_hal_watchdog_Watchdog, _embedded_hal_watchdog_WatchdogEnable,
     };
     use embedded_hal::digital::v2::InputPin;
-    use embedded_time::duration::Extensions;
+    use embedded_hal::serial::{Read, Write};
+    use fugit::MicrosDurationU32;
     use keyberon::debounce::Debouncer;
     use keyberon::key_code;
     use keyberon::layout::{Event, Layout};
     use keyberon::matrix::Matrix;
     use rp2040_hal::clocks::init_clocks_and_plls;
-    use rp2040_hal::gpio::{DynPin, Pins};
+    use rp2040_hal::gpio::bank0::{Gpio0, Gpio1};
+    use rp2040_hal::gpio::{DynPin, FunctionUart, Pin, Pins};
     use rp2040_hal::pac::UART0;
     use rp2040_hal::timer::{Alarm, Alarm0};
+    use rp2040_hal::uart::{Enabled, UartPeripheral};
     use rp2040_hal::usb::UsbBus;
-    use rp2040_hal::{Clock, Sio, Timer, Watchdog};
+    use rp2040_hal::{uart, Clock, Sio, Timer, Watchdog};
     use usb_device::class_prelude::UsbBusAllocator;
     use usb_device::class_prelude::UsbClass;
     use usb_device::prelude::UsbDeviceState;
+
+    type Uart =
+        UartPeripheral<Enabled, UART0, (Pin<Gpio0, FunctionUart>, Pin<Gpio1, FunctionUart>)>;
+
+    #[derive(Copy, Clone)]
+    pub enum ReceivedAction {
+        Press,
+        Release,
+    }
+
+    #[derive(Default)]
+    pub struct RA {
+        pub inner: Option<ReceivedAction>,
+    }
+    impl RA {
+        pub fn update(&mut self, action: Option<ReceivedAction>) {
+            self.inner = action
+        }
+    }
 
     // TODO: cleanup some shared resources into local
     #[shared]
@@ -39,7 +61,6 @@ mod app {
         usb_dev: usb_device::device::UsbDevice<'static, UsbBus>,
         // TODO: add leds
         usb_class: keyberon::Class<'static, UsbBus, ()>,
-        // TODO: add usb connection somehow
 
         // Utils
         #[lock_free]
@@ -50,17 +71,25 @@ mod app {
         watchdog: Watchdog,
 
         // KB
+        main_layout: Layout<18, 6, 1, ()>,
         layout: Layout<9, 6, 1, ()>,
         #[lock_free]
         matrix: Matrix<DynPin, DynPin, 9, 6>,
         #[lock_free]
         debouncer: Debouncer<[[bool; 9]; 6]>,
+        #[lock_free]
         left_side: bool,
-        uart: UART0,
+
+        uart: Uart,
+        #[lock_free]
+        action: RA,
     }
 
     static mut USB_BUS: Option<UsbBusAllocator<UsbBus>> = None;
     const TIMER: u32 = 500;
+    const PRESS_ID: u8 = 255;
+    const RELEASE_ID: u8 = 254;
+    const ERROR_ID: u8 = 253;
 
     #[local]
     struct Local {}
@@ -92,27 +121,28 @@ mod app {
         );
 
         let side = pins.gpio4.into_floating_input();
-        let left_side = side.is_high().unwrap();
 
         let mut timer = Timer::new(c.device.TIMER, &mut resets);
-        let delay = Delay::new(c.core.SYST, clocks.system_clock.freq().0);
+        let delay = Delay::new(c.core.SYST, clocks.system_clock.freq().to_Hz());
         let mut alarm = timer.alarm_0().unwrap();
-        let _ = alarm.schedule(TIMER.microseconds());
+        let _ = alarm.schedule(MicrosDurationU32::micros(TIMER));
         alarm.enable_interrupt();
 
-        // Enable UART0
-        resets.reset.modify(|_, w| w.uart0().clear_bit());
-        // Wait for clear
-        while resets.reset_done.read().uart0().bit_is_clear() {}
-        let uart = c.device.UART0;
-        // Baudrate is configured as integer / fraction
-        // Integer = 67
-        uart.uartibrd.write(|w| unsafe { w.bits(0b0100_0011) });
-        // Decimal = 52
-        uart.uartfbrd.write(|w| unsafe { w.bits(0b0011_0100) });
-        uart.uartlcr_h.write(|w| unsafe { w.bits(0b0110_0000) });
-        uart.uartcr.write(|w| unsafe { w.bits(0b11_0000_0001) });
-        uart.uartimsc.write(|w| w.rxim().set_bit());
+        // Enable UART0, we need to swap the pins when working with different sides
+        let uart_pins = (
+            // UART TX (characters sent from RP2040) on pin 1 (GPIO0)
+            pins.gpio0.into_mode::<FunctionUart>(),
+            // UART RX (characters received by RP2040) on pin 2 (GPIO1)
+            pins.gpio1.into_mode::<FunctionUart>(),
+        );
+
+        let mut uart = UartPeripheral::new(c.device.UART0, uart_pins, &mut resets)
+            .enable(
+                uart::common_configs::_9600_8_N_1,
+                clocks.peripheral_clock.freq(),
+            )
+            .unwrap();
+        uart.enable_rx_interrupt();
 
         let usb_bus = UsbBusAllocator::new(UsbBus::new(
             c.device.USBCTRL_REGS,
@@ -127,9 +157,11 @@ mod app {
         }
 
         let usb_class = keyberon::new_class(unsafe { USB_BUS.as_ref().unwrap() }, ());
+        // TODO: custom dev info
         let usb_dev = keyberon::new_device(unsafe { USB_BUS.as_ref().unwrap() });
 
-        watchdog.start(10_000.microseconds());
+        watchdog.start(MicrosDurationU32::micros(10_000u32));
+        let left_side = side.is_high().unwrap();
 
         let rows = if left_side {
             [
@@ -159,6 +191,7 @@ mod app {
                 timer,
                 alarm,
                 watchdog,
+                main_layout: Layout::new(&LAYER),
                 layout: if left_side {
                     Layout::new(&LEFT_LAYER)
                 } else {
@@ -183,6 +216,7 @@ mod app {
                 debouncer: Debouncer::new([[false; 9]; 6], [[false; 9]; 6], 10),
                 left_side,
                 uart,
+                action: RA::default(),
             },
             Local {},
             init::Monotonics(),
@@ -201,9 +235,9 @@ mod app {
         });
     }
 
-    #[task(priority = 2, capacity = 8, shared = [usb_dev, usb_class, layout])]
+    #[task(priority = 2, capacity = 8, shared = [usb_dev, usb_class, main_layout])]
     fn handle_event(mut c: handle_event::Context, event: Option<Event>) {
-        let mut layout = c.shared.layout;
+        let mut layout = c.shared.main_layout;
         match event {
             None => {
                 layout.lock(|l| l.tick());
@@ -241,13 +275,13 @@ mod app {
         while let Ok(0) = c.shared.usb_class.lock(|k| k.write(report.as_bytes())) {}
     }
 
-    #[task(binds = TIMER_IRQ_0, priority = 1, shared = [matrix, debouncer, delay, timer, alarm, watchdog, usb_dev, usb_class])]
+    #[task(binds = TIMER_IRQ_0, priority = 1, shared = [matrix, debouncer, delay, timer, alarm, watchdog, usb_dev, usb_class, left_side, uart])]
     fn scan_timer_irq(mut c: scan_timer_irq::Context) {
         let mut alarm = c.shared.alarm;
 
         alarm.lock(|a| {
             a.clear_interrupt();
-            let _ = a.schedule(TIMER.microseconds());
+            let _ = a.schedule(MicrosDurationU32::micros(TIMER));
         });
 
         c.shared.watchdog.feed();
@@ -256,13 +290,91 @@ mod app {
             .matrix
             .get_with_delay(|| c.shared.delay.delay_us(5))
             .unwrap();
-        // let keys_pressed = c.shared.matrix.get().unwrap();
-        let deb_events = c.shared.debouncer.events(keys_pressed);
+        let events = c.shared.debouncer.events(keys_pressed);
 
-        for event in deb_events {
-            handle_event::spawn(Some(event)).unwrap();
+        // TODO: try to handle duplex communication
+        if *c.shared.left_side {
+            // if c.shared.uart.uart_is_readable() {
+            //     handle_event::spawn(Some(Event::Release(1, 1))).unwrap();
+            // }
+
+            for event in events {
+                handle_event::spawn(Some(event)).unwrap();
+            }
+
+            c.shared.uart.lock(|uart| {
+                if uart.uart_is_readable() {
+                    handle_event::spawn(Some(Event::Press(3, 3))).unwrap();
+                    handle_event::spawn(Some(Event::Release(3, 3))).unwrap();
+                }
+            });
+
+            handle_event::spawn(None).unwrap();
+        } else {
+            for event in events {
+                c.shared.uart.lock(|uart| {
+                    if uart.uart_is_writable() {
+                        handle_event::spawn(Some(Event::Press(3, 3))).unwrap();
+                        handle_event::spawn(Some(Event::Release(3, 3))).unwrap();
+
+                        //   1  /  0      1111111  | 10010 110
+                        // Press/Release  Verifier | X     Y
+
+                        // The verifier helps us know which byte were looking at, it should help us tackle desync
+                        let (ident, key) = match event {
+                            Event::Press(i, j) => (PRESS_ID, (i << 3) | j),
+                            Event::Release(i, j) => (RELEASE_ID, (i << 3) | j),
+                        };
+
+                        uart.write_raw(&[ident, key]).unwrap();
+                    }
+                })
+            }
+            handle_event::spawn(None).unwrap();
+        }
+    }
+
+    #[task(binds = UART0_IRQ, priority = 4, shared = [uart, action])]
+    fn rx(mut c: rx::Context) {
+        fn process_key(uart: &mut Uart) -> (u8, u8) {
+            match uart.read() {
+                Ok(key) => ((key >> 3) & 0b0011111, key & 0b00000111),
+                Err(_) => (255, 255),
+            }
         }
 
-        handle_event::spawn(None).unwrap();
+        // handle_event::spawn(Some(Event::Release(1, 1))).unwrap();
+
+        handle_event::spawn(Some(Event::Press(3, 3))).unwrap();
+        handle_event::spawn(Some(Event::Release(3, 3))).unwrap();
+
+        c.shared.uart.lock(|uart| {
+            if uart.uart_is_readable() {
+                if let Some(action) = c.shared.action.inner {
+                    let (x, y) = process_key(uart);
+
+                    let key = match action {
+                        ReceivedAction::Press => Event::Press(x, y),
+                        ReceivedAction::Release => Event::Release(x, y),
+                    };
+                    handle_event::spawn(Some(key)).unwrap();
+
+                    c.shared.action.update(None);
+                } else {
+                    let ident = match uart.read() {
+                        Ok(ident) => ident,
+                        Err(_) => ERROR_ID,
+                    };
+
+                    if ident == PRESS_ID {
+                        c.shared.action.update(Some(ReceivedAction::Press));
+                    } else if ident == RELEASE_ID {
+                        c.shared.action.update(Some(ReceivedAction::Release));
+                    } else {
+                        c.shared.action.update(None);
+                    };
+                }
+            }
+        })
     }
 }
